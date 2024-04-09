@@ -7,12 +7,12 @@ from os.path import join
 
 from adapt.intent import IntentBuilder
 
-from core.audio import wait_while_speaking
-from core.llm import dialog_prompt, main_persona_prompt, status_report_prompt
-from core.messagebus.message import Message
-from core.skills import Skill, intent_handler
+from source.audio import wait_while_speaking
+from source.core import Skill, intent_handler
+# from core.llm import dialog_prompt, main_persona_prompt, status_report_prompt
+from source.messagebus.message import Message
 
-SECONDS = 5
+SECONDS = 6
 
 
 class CoreSkill(Skill):
@@ -20,15 +20,17 @@ class CoreSkill(Skill):
         super(CoreSkill, self).__init__(name="CoreSkill")
 
     def initialize(self):
-        core_path = os.path.join(os.path.dirname(sys.modules["core"].__file__), "..")
-        self.core_path = os.path.abspath(core_path)
+        source_path = os.path.join(os.path.dirname(sys.modules["source"].__file__), "..")
+        self.core_path = os.path.abspath(source_path)
         self.interrupted_utterance = None
         self.playback_altered = False
+        self.start_time = None
         # self.add_event("core.wakeword", self.handle_wakeword)
         self.add_event("core.shutdown", self.handle_core_shutdown)
         self.add_event("core.reboot", self.handle_core_reboot)
         self.add_event("recognizer_loop:utterance", self.set_response_latency_callback)
         self.add_event("speak", self.cancel_response_latency_callback)
+        self.add_event("core.stop", self.restore_playback_volume)
         # self.add_event(
         #     "recognizer_loop:audio_output_start",
         #     self.cancel_interrupted_utterance_callback,
@@ -39,7 +41,19 @@ class CoreSkill(Skill):
         self.add_event("recognizer_loop:audio_output_end", self.restore_playback_volume)
         # self.add_event("core.interrupted_utterance", self.set_interrupted_utterance)
         # self.add_event("core.wakeword", self.reduce_playback_volume)
-        self.add_event("core.mic.listen", self.reduce_playback_volume)
+        # Calculate time to respond to utterance
+        self.add_event("recognizer_loop:utterance", self.start_tts_timer)
+        self.add_event("recognizer_loop:audio_output_start", self.stop_tts_timer)
+        self.add_event("recognizer_loop:listen", self.reduce_playback_volume)
+        self.add_event("recognizer_loop:record_begin", self.reduce_playback_volume)
+
+    def start_tts_timer(self):
+        self.start_time = time.time()
+
+    def stop_tts_timer(self):
+        if self.start_time:
+            time_taken = time.time() - self.start_time
+            self.log.info(f"TIME TAKEN TO HANDLE UTTERANCE: {time_taken}")
 
     def reduce_playback_volume(self):
         self.playback_altered = True
@@ -90,32 +104,41 @@ class CoreSkill(Skill):
     def set_interrupted_utterance(self, message):
         self.interrupted_utterance = message.data.get("utterance")
 
-    def handle_interrupted_utterance(self):
-        if self.interrupted_utterance:
-            if "?" in self.interrupted_utterance:
-                self.log.info(
-                    f"Resuming interrupted utterance: {self.interrupted_utterance}"
-                )
-                context = (
-                    "You were interrupted while saying the following utterance given in "
-                    "the query. What you want to do is complete the interrupted utterance. "
-                    "An example, 'Sir like I was saying, ...' or"
-                    "'As I was saying before we were interrupted, ...' or"
-                    "'Sir, Where was I? ...' "
-                )
-                interrupted_response = self.llm.llm_response(
-                    prompt=dialog_prompt,
-                    context=context,
-                    query=self.interrupted_utterance,
-                )
-                wait_while_speaking()
-                # listen if dialog ends with question mark
-                # if_question_mark = interrupted_response.endswith("?")
-                # self.speak(interrupted_response, expect_response=if_question_mark)
-                # tts.store_interrupted_utterance(None)  # set interrupted_utterance None
-                self.cancel_scheduled_event("handle_interrupted_utterance")
-                self.bus.emit(Message("core.handled.interrupted_utterance"))
-            self.interrupted_utterance = None
+    # def handle_interrupted_utterance(self):
+    #     if self.interrupted_utterance:
+    #         if "?" in self.interrupted_utterance:
+    #             self.log.info(
+    #                 f"Resuming interrupted utterance: {self.interrupted_utterance}"
+    #             )
+    #             context = (
+    #                 "You were interrupted while saying the following utterance given in "
+    #                 "the query. What you want to do is complete the interrupted utterance. "
+    #                 "An example, 'Sir like I was saying, ...' or"
+    #                 "'As I was saying before we were interrupted, ...' or"
+    #                 "'Sir, Where was I? ...' "
+    #             )
+    #             interrupted_response = self.llm.llm_response(
+    #                 prompt=dialog_prompt,
+    #                 context=context,
+    #                 query=self.interrupted_utterance,
+    #             )
+    #             wait_while_speaking()
+    #             # listen if dialog ends with question mark
+    #             # if_question_mark = interrupted_response.endswith("?")
+    #             # self.speak(interrupted_response, expect_response=if_question_mark)
+    #             # tts.store_interrupted_utterance(None)  # set interrupted_utterance None
+    #             self.cancel_scheduled_event("handle_interrupted_utterance")
+    #             self.bus.emit(Message("core.handled.interrupted_utterance"))
+    #         self.interrupted_utterance = None
+    @intent_handler(IntentBuilder("").require("Pause"))
+    def handle_pause_spotify_music(self, message):
+        subprocess.run(["osascript", "-e", 'tell application "Spotify" to pause'])
+        self.speak("Acknowledged Sir, pausing music")
+
+    @intent_handler(IntentBuilder("").require("Play"))
+    def handle_play_spotify_music(self, message):
+        subprocess.run(["osascript", "-e", 'tell application "Spotify" to play'])
+        self.speak("Acknowledged Sir.")
 
     # change yes to a a Vocabulary for flexibility
     @intent_handler(IntentBuilder("").require("Reboot"))
@@ -138,7 +161,7 @@ class CoreSkill(Skill):
 
     @intent_handler(IntentBuilder("").require("Mute").optionally("Microphone"))
     def handle_microphone_mute(self, message):
-        self.bus.emit(Message("core.mic.mute"))
+        self.bus.emit(Message("recognizer_loop:mute"))
 
     def set_response_latency_callback(self, message):
         """Schedule notification to tell user that processing is longer than usual"""
@@ -161,7 +184,7 @@ class CoreSkill(Skill):
         """
         self.speak_dialog("shutdown.core")
         time.sleep(2)
-        path = join(self.core_path, "stop-core.sh")
+        path = join(self.core_path, "stop.sh")
         os.system(path)
 
     # TODO: make component only reboot
@@ -176,7 +199,7 @@ class CoreSkill(Skill):
         )
 
         wait_while_speaking()
-        path = join(self.core_path, "start-core.sh all restart")
+        path = join(self.core_path, "start.sh all restart")
         os.system(path)
 
     @intent_handler(IntentBuilder("").require("Reboot").require("Voice"))
@@ -184,12 +207,9 @@ class CoreSkill(Skill):
         """
         Restart voice component
         """
-        utterance = message.data.get("utterance")
-        context = "asking to restart your voice component"
-        self.llm.llm_response(
-            prompt=status_report_prompt, query=utterance, context=context
-        )
-        path = join(self.core_path, "start-core.sh")
+
+        self.speak_dialog("reloading", wait=True)
+        path = join(self.core_path, "start.sh")
         subprocess.call([path, "restart", "voice"])
 
     @intent_handler(IntentBuilder("").require("Reboot").require("Skills"))
@@ -197,13 +217,9 @@ class CoreSkill(Skill):
         """
         Restart skills component
         """
-        utterance = message.data.get("utterance")
-        context = "asking to restart your skills component"
-        response = self.llm.llm_response(
-            prompt=status_report_prompt, query=utterance, context=context
-        )
-        self.speak(response, wait=True)
-        path = join(self.core_path, "start-core.sh")
+
+        self.speak_dailog("reloading", wait=True)
+        path = join(self.core_path, "start.sh")
         subprocess.call([path, "restart", "skills"])
 
     def handle_system_reboot(self, _):
